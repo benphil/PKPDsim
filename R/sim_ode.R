@@ -2,24 +2,30 @@
 #'
 #' Simulates a specified ODE system and regimen
 #' @param ode function describing the ODE system
-#' @param parameters
+#' @param dde function describing the DDE system (not implemented yet)
+#' @param parameters model parameters
 #' @param omega vector describing the lower-diagonal of the between-subject variability matrix
 #' @param omega_type exponential or normal
 #' @param n_ind number of individuals to simulate
 #' @param regimen a regimen object created using the regimen() function
 #' @param adherence List specifying adherence. Simulates adherence using either markov model or binomial sampling.
 #' @param A_init vector with the initial state of the ODE system
+#' @param covariates list of covariate values to be passed to ODE function
+#' @param only_obs only return the observations
 #' @param obs_step_size the step size between the observations
 #' @param int_step_size the step size for the numerical integrator
 #' @param t_max maximum simulation time, if not specified will pick the end of the regimen as maximum
-#' @param t_obs vector of observation times, only output these values
+#' @param t_obs vector of observation times, only output these values (only used when t_obs==NULL)
 #' @param t_tte vector of observation times for time-to-event simulation
+#' @param duplicate_t_obs allow duplicate t_obs in output? E.g. for a bolus dose at t=24, the default (FALSE) will be to output only the trough, so for bolus doses you might want to switch this setting to TRUE (when used for plotting).
 #' @param rtte should repeated events be allowed (FALSE by default)
-#' @param output vector specifying which compartment numbers to output
+#' @param covariate_model feature not implemented yet.
+#' @param verbose show more output
 #' @return a data frame of compartments with associated concentrations at requested times
 #' @export
 #' @seealso \link{sim_ode_shiny}
 #' @examples
+#' \dontrun{
 #'library(ggplot2)
 #'library(PKPDsim)
 #'p <- list(CL = 38.48,
@@ -56,7 +62,7 @@
 #'  geom_line() +
 #'  scale_y_log10() +
 #'  facet_wrap(~comp)
-
+#'}
 sim_ode <- function (ode = NULL,
                      dde = NULL,
                      parameters = list(),
@@ -68,12 +74,13 @@ sim_ode <- function (ode = NULL,
                      covariates = NULL,
                      covariate_model = NULL,
                      A_init = NULL,
-                     obs = NULL,
+                     only_obs = FALSE,
                      obs_step_size = 1,
-                     int_step_size = 0.01,
+                     int_step_size = .1,
                      t_max = NULL,
                      t_obs = NULL,
                      t_tte = NULL,
+                     duplicate_t_obs = FALSE,
                      rtte = FALSE,
                      verbose = FALSE
                      ) {
@@ -95,7 +102,7 @@ sim_ode <- function (ode = NULL,
   if(!is.null(dde)) {
     ode <- dde
   }
-  if (class(ode) == "character") {
+  if ("character" %in% class(ode)) {
     ode <- get(ode)
   }# else {
   #  stop("Error: the 'ode' argument to this function should be a character string referencing the function, not the function itself.")
@@ -106,16 +113,6 @@ sim_ode <- function (ode = NULL,
   } else {
     cpp <- FALSE
   }
-#   if (!is.null(attr(ode, "obs")[["scale"]])) {
-#     suppressWarnings({
-#       scale_par <- attr(ode, "obs")$scale[is.na(as.numeric(attr(ode, "obs")$scale))]
-#       if(length(scale_par) > 0) {
-#         if(!all(scale_par %in% names(parameters))) {
-#           stop("One of the scale parameters for the output data (defined using new_ode_model(obs = list(scale = ...))) was not found in the parameter list passed to sim_ode().")
-#         }
-#       }
-#     })
-#   }
   if(is.null(ode) | is.null(parameters)) {
     stop("Please specify at least the required arguments 'ode' and 'parameters'.")
   }
@@ -125,10 +122,10 @@ sim_ode <- function (ode = NULL,
 #   if(!is.null(t_tte)) {
 #     stop("Please specify possible observation times for time-to-event analysis as 't_tte' argument!")
 #   }
-  if(class(ode) == "function" && is.null(attr(ode, "cpp")) || attr(ode, "cpp") == FALSE) {
-    size <- get_size_ode(ode, parameters)
+  if("function" %in% class(ode) && is.null(attr(ode, "cpp")) || attr(ode, "cpp") == FALSE) {
+    stop("Sorry. Non-C++ functions are deprecated.")
   } else {
-    if(class(ode) == "function") {
+    if("function" %in% class(ode)) {
       size <- attr(ode,  "size")
     } else {
       size <- attr(get(ode),  "size")
@@ -150,6 +147,26 @@ sim_ode <- function (ode = NULL,
   }
   comb <- list()
   p <- parameters
+  if(is.null(t_obs)) { # find reasonable default to output
+    if(is.null(obs_step_size)) {
+      if(length(regimen$dose_times) == 1 && regimen$dose_times == 0) {
+        obs_step_size <- 1
+      } else {
+        obs_step_size <- 100
+        if(max(regimen$dose_times) < 10000) { obs_step_size <- 100 }
+        if(max(regimen$dose_times) < 1000) { obs_step_size <- 10 }
+        if(max(regimen$dose_times) < 100) { obs_step_size <- 1 }
+        if(max(regimen$dose_times) < 10) { obs_step_size <- .1 }
+      }
+    }
+    if("regimen" %in% class(regimen)) {
+      if(length(regimen$dose_times) == 1 && regimen$dose_times == 0) {
+        t_obs <- seq(from=regimen$dose_times[1], to=24, by=obs_step_size)
+      } else {
+        t_obs <- seq(from=0, to=max(regimen$dose_times)*1.2, by=obs_step_size)
+      }
+    }
+  }
   if(! any(c("regimen", "regimen_multiple") %in% class(regimen))) {
     stop("Please create a regimen using the new_regimen() function!")
   }
@@ -173,19 +190,9 @@ sim_ode <- function (ode = NULL,
       stop("Not all parameters for this model have been specified. Missing parameters are: \n  ", paste(pars_ode[-m[!is.na(m)]], collapse=", "))
     }
   }
-  if(is.null(t_obs)) { # find reasonable default to output
-    if(is.null(obs_step_size)) {
-      obs_step_size <- 100
-      if(max(design$t) < 10000) { obs_step_size <- 100 }
-      if(max(design$t) < 1000) { obs_step_size <- 10 }
-      if(max(design$t) < 100) { obs_step_size <- 1 }
-      if(max(design$t) < 10) { obs_step_size <- .1 }
-    }
-    if("regimen" %in% class(regimen)) {
-      t_obs <- seq(from=0, to=max(design$t), by=obs_step_size)
-    }
+  if(verbose) {
+    message("Simulating...")
   }
-  message("Simulating...")
   for (i in 1:n_ind) {
     p_i <- p
     if("regimen_multiple" %in% class(regimen)) {
@@ -216,15 +223,7 @@ sim_ode <- function (ode = NULL,
         p_i$dose_type <- "bolus"
       }
     }
-    times <- seq(from=0, to=tail(design_i$t,1), by=int_step_size)
-#     if (!is.null(covariates) && !is.null(covariate_model)) {
-#       keys <- names(p_i)[names(p_i) %in% names(covariate_model)]
-#       if (length(keys) > 0) {
-#         for (j in seq(keys)) {
-#           p_i[[keys[j]]] <- covariate_model[[keys[j]]](par = p_i[[keys[j]]], cov = covariates[i,])
-#         }
-#       }
-#     }
+    times <- unique(c(seq(from=0, to=tail(design_i$t,1), by=int_step_size), t_obs))
     A_init_i <- A_init
     if (!is.null(adherence)) {
       if(adherence$type == "markov") {
@@ -247,6 +246,15 @@ sim_ode <- function (ode = NULL,
     tmp <- c()
     prv_cumhaz <- 0
     if(cpp) {
+      if(!is.null(t_max)) {
+        p_i$dose_times <- p_i$dose_times[p_i$dose_times <= t_max]
+      }
+      if(length(p_i$t_inf) < length(p_i$dose_times)) {
+        p_i$t_inf <- rep(p_i$t_inf[1], length(p_i$dose_times))
+      }
+      for(k in seq(p_i$dose_times)) {
+        design_i[design_i$t >= p_i$dose_times[k] & design_i$t < (p_i$dose_times[k] + p_i$t_inf[k]),]$rate <- (p_i$dose_amts[k] / p_i$t_inf[k])
+      }
       p_i$rate <- 0
       tmp <- ode (A_init_i, design_i, p_i, int_step_size)
       des_out <- cbind(matrix(unlist(tmp$y), nrow=length(tmp$time), byrow = TRUE))
@@ -254,7 +262,11 @@ sim_ode <- function (ode = NULL,
       for (j in 1:length(A_init_i)) {
         dat_ind <- rbind (dat_ind, cbind(id=i, t=tmp$time, comp=j, y=des_out[,j]))
       }
-      dat_ind <- rbind(dat_ind, cbind(id=i, t=tmp$time, comp="obs", y=unlist(tmp$obs)))
+      if(only_obs) {
+        dat_ind <- cbind(id=i, t=tmp$time, comp="obs", y=unlist(tmp$obs))
+      } else {
+        dat_ind <- rbind(dat_ind, cbind(id=i, t=tmp$time, comp="obs", y=unlist(tmp$obs)))
+      }
       if(i == 1) {
         l_mat <- length(dat_ind[,1])
         comb <- matrix(nrow = l_mat*n_ind, ncol=ncol(dat_ind)) # don't grow but define upfront
@@ -312,42 +324,53 @@ sim_ode <- function (ode = NULL,
   # Add concentration to dataset, and perform scaling and/or transformation:
   comb <- data.frame(comb)
   colnames(comb) <- c("id", "t", "comp", "y")
-#   if(!is.null(attr(ode, "obs"))) {
-#     scale <- rep(1, length(attr(ode, "obs")[["scale"]]))
-#     if(!is.null(attr(ode, "obs")[["labels"]])) {
-#       labels <- attr(ode, "obs")[["labels"]]
-#     } else {
-#       if (length(scale) == 1) {
-#         labels <- "obs"
-#       } else {
-#         labels <- paste0("obs_", attr(ode, "obs")[["labels"]],
-#                          seq(from=1, to=length(attr(ode, "obs")[["scale"]])))
-#       }
-#     }
-#     if (!is.null(attr(ode, "obs")[["scale"]])) {
-#       suppressWarnings({
-#         for (i in seq(attr(ode, "obs")[["scale"]])) {
-#           if(!is.na(as.numeric(attr(ode, "obs")[["scale"]][i]))) {
-#             scale[i] <- as.numeric(attr(ode, "obs")[["scale"]][i])
-#           } else {
-#             scale[i] <- as.numeric(p[[attr(ode, "obs")[["scale"]][i]]])
-#           }
-#         }
-#       })
-#     }
-#     for (i in seq(labels)) {
-#       comb <- rbind (comb, comb %>% dplyr::filter(comp == attr(ode, "obs")[["cmt"]][i]) %>% dplyr::mutate(comp = labels[i], y = y/scale[i]))
-#       if(!is.null(attr(ode, "obs")[["trans"]][i])) {
-#         if(class(attr(ode, "obs")[["trans"]][i]) == "character") {
-#           trans_func <- get(attr(ode, "obs")[["trans"]][i])
-#           comb[comb$comp == labels[i],]$y <- trans_func(comb[comb$comp == labels[i],]$y)
-#         }
-#       }
-#     }
-#   }
-  # comb <- comb %>% dplyr::filter(comp %in% labels)
+  if(!cpp) { # For simulations with Cpp code this part is already done, for deSolve this still needs to be done.
+      if(!is.null(attr(ode, "obs"))) {
+        scale <- rep(1, length(attr(ode, "obs")[["scale"]]))
+        if(!is.null(attr(ode, "obs")[["labels"]])) {
+          labels <- attr(ode, "obs")[["labels"]]
+        } else {
+          if (length(scale) == 1) {
+            labels <- "obs"
+          } else {
+            labels <- paste0("obs_", attr(ode, "obs")[["labels"]],
+                             seq(from=1, to=length(attr(ode, "obs")[["scale"]])))
+          }
+        }
+        if (!is.null(attr(ode, "obs")[["scale"]])) {
+          suppressWarnings({
+            for (i in seq(attr(ode, "obs")[["scale"]])) {
+              if(!is.na(as.numeric(attr(ode, "obs")[["scale"]][i]))) {
+                scale[i] <- as.numeric(attr(ode, "obs")[["scale"]][i])
+              } else {
+                scale[i] <- as.numeric(p[[attr(ode, "obs")[["scale"]][i]]])
+              }
+            }
+          })
+        }
+        for (i in seq(labels)) {
+          comb <- rbind (comb, comb %>% dplyr::filter(comp == attr(ode, "obs")[["cmt"]][i]) %>% dplyr::mutate(comp = labels[i], y = y/scale[i]))
+          if(!is.null(attr(ode, "obs")[["trans"]][i])) {
+            if(class(attr(ode, "obs")[["trans"]][i]) == "character") {
+              trans_func <- get(attr(ode, "obs")[["trans"]][i])
+              comb[comb$comp == labels[i],]$y <- trans_func(comb[comb$comp == labels[i],]$y)
+            }
+          }
+        }
+      }
+      # comb <- comb %>% dplyr::filter(comp %in% labels)
+  }
+  # filter out observations
+  comb$t <- as.numeric(as.character(comb$t))
   if(!is.null(t_obs)) {
-    comb <- comb %>% dplyr::filter(t %in% t_obs)
+    pick_closest_vec <- function(x, vec) { # pick closests time points. If _times integrator is used this is not necessary, but leaving in just to make sure
+      pick_closest <- function(x) {
+        which(abs(vec-x) == min(abs(vec-x)))
+      }
+      unlist(lapply(x, pick_closest))
+    }
+    idx <- pick_closest_vec(t_obs, comb$t)
+    comb <- comb[idx,]
   }
   if(length(events)>0) {
     events <- data.frame(events)
@@ -371,6 +394,9 @@ sim_ode <- function (ode = NULL,
   comb$t <- as.num(comb$t)
   comb$y <- as.num(comb$y)
   comb <- data.frame(comb %>% arrange(id, comp, t))
+  if(!duplicate_t_obs) {
+    comb <- data.frame(comb %>% dplyr::group_by(id, comp) %>% dplyr::distinct(t))
+  }
   class(comb) <- c(class(comb), "PKPDsim")
   return(comb)
 }
